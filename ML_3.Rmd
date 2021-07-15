@@ -1,0 +1,302 @@
+---
+title: "Homework_3"
+author: "Lindley Slipetz"
+date: "7/15/2021"
+output: pdf_document
+---
+
+For this homework, I will again be using the Childhood adversity and traumatic stress among inpatients at a psychiatric hospital in the Baltimore area from 1993-1995. The data include diagnoses, psychological symptoms, physical and sexual abuse, post-traumatic stress disorder, self-destructive behavior, and demographic data. I will be predicting the occurence of a substance abuse disorder (both primary and secondary diagnoses) from gender, occurence of anxiety disorder, occurence of dissociative disorder, occurence of mood disorder, age, marital status, SES, social support as a child, and self-destructive behaviors (alcohol/drugs, eating, sexual impulsiveness, self-harm, and suicidality)
+
+Let's load the data and the packages!
+
+```{r load, warnings = FALSE, message = FALSE}
+library(mlbench)
+library(parallel)
+#install.packages("doParallel")
+library(doParallel)
+library(foreach)
+library(MASS)
+library(ggplot2)
+library(caret)
+#install.packages("ranger")
+library(ranger)
+library(pROC)
+#install.packages("party")
+library(party)
+library(dplyr)
+#install.packages("ggraph")
+library(ggraph)
+library(igraph)
+#install.packages("rpart.plot")
+library(rpart.plot)
+library(rpart)
+library(rpart.plot)
+#install.packages("gbm")
+library(gbm)
+library(dplyr)
+library(ggraph)
+library(igraph)
+library(tidyverse)
+full_data <- read.table(file = 'G:\\My Drive\\ICPSR\\ML\\HW_2\\36168-0001-Data.tsv', sep = '\t', header = TRUE)
+
+```
+
+Now, we're going to subset the data to just the variables of interest.
+
+```{r subset}
+subset_data <- full_data %>%
+  select(SUBDX, SEX, ANXDX, DISDX, MOODDX, AGE, MAR, SES, SSC, SISDB_TOT)
+```
+
+Now we're going to check if there's any missing data.
+
+```{r NA_check}
+df <- as.data.frame(
+  cbind(
+    lapply(
+      lapply(subset_data, is.na), sum)
+    )
+  )
+
+rownames(subset(df, df$V1 != 0))
+```
+Two columns have missing data. Let's see how much there is.
+
+```{r NA_sum}
+sum(is.na(subset_data$SSC))
+sum(is.na(subset_data$SISDB_TOT))
+```
+
+That isn't too bad. Let's just omit the missing data.
+
+```{r complete}
+complete_data <- na.omit(subset_data)
+```
+
+Making factors.
+
+```{r factor}
+complete_data$SUBDX  <- factor(complete_data$SUBDX, labels=c("NSU","SU"))
+```
+
+
+
+Pre-process data.
+
+```{r process}
+set.seed(39846)
+impute <- preProcess(complete_data, method=c("center","scale"))
+complete_data <- predict(impute, complete_data)
+```
+
+Let's split the data.
+
+```{r split}
+set.seed(2964746)
+trainIndex <- createDataPartition(complete_data$SUBDX, p=0.2, list = FALSE, times = 1)
+train <- complete_data[trainIndex,]
+test <- complete_data[-trainIndex,]
+
+```
+
+# Single tree
+
+Fitting classification tree.
+
+```{r tree_fit}
+set.seed(1985)
+fit <- rpart(SUBDX ~ ., data = train,
+  control = rpart.control(minsplit = 10, minbucket = 5))
+
+```
+
+Plotting tree.
+
+```{r tree_plot}
+rpart.plot(fit)
+
+```
+
+So it starts by splitting males to right and females to the left. Then it splits the males into ages centered on standardized at 0.072. The highest proportion of substance use is males older than the standardized score of 0.072.
+
+
+```{r fit_1}
+train.pred <- predict(fit, train, type="class")
+test.pred <- predict(fit, test, type="class")
+#
+confusionMatrix(as.factor(train$SUBDX), train.pred)
+confusionMatrix(as.factor(test$SUBDX), test.pred)
+```
+
+Accuracy is 83% for the training data and 68% for the testing data. That's not too good.
+
+Pruning the tree.
+
+```{r prune}
+plotcp(fit)
+pfit <- prune(fit, cp=fit$cptable[which.min(fit$cptable[,"xerror"]),"CP"])
+
+```
+
+Pruned tree plot.
+
+```{r prune_plot}
+rpart.plot(pfit)
+```
+
+# Random forest
+
+Parallel processing
+
+```{r parallel}
+cl <- makeCluster(detectCores() - 1, setup_timeout = 0.5) 
+registerDoParallel(cl)
+
+```
+
+Set control parameters
+
+```{r control_1}
+fitCtrl <- trainControl(method = "repeatedcv",
+                        number = 10,
+                        repeats = 2,
+                        summaryFunction=twoClassSummary,
+                        ## Estimate class probabilities
+                        classProbs = TRUE,
+                        ## Search "grid" or "random"
+                        search = "random",
+                        ## Use cluster
+                        allowParallel = TRUE)
+
+```
+
+Testing grid.
+
+```{r grid_1}
+rfGrid <- expand.grid(mtry=c(2:7),
+	min.node.size=c(1,5),
+	splitrule=c("gini","extratrees"))
+```
+
+Forest.
+
+```{r forest}
+rf.res <- train(SUBDX ~ .,
+    data=train,
+    method="ranger",
+    trControl=fitCtrl,
+    tuneGrid=rfGrid,
+    importance="impurity",
+    num.trees=500,
+    metric="ROC",
+    verbose=FALSE)
+rf.res
+plot(rf.res)
+
+```
+
+ROC is maximized for 5 splits, and minimum node size of 5.
+
+Confusion matrix.
+
+```{r confuse_2}
+confusionMatrix(predict(rf.res, train, type="raw"), train$SUBDX)
+confusionMatrix(predict(rf.res, test, type="raw"), test$SUBDX)
+
+```
+
+Training data is predicted with 95% accuracy and the testing data is predicted with 76% accuracy.
+
+ROC graphs
+
+```{r ROC}
+pred.train <- predict(rf.res, train, type="prob")[,"SU"]
+roc(train$SUBDX ~ pred.train)
+#
+pred.test <- predict(rf.res, test, type="prob")[,"SU"]
+roc(test$SUBDX ~ pred.test)
+#
+plot.roc(train$SUBDX, pred.train)
+plot.roc(test$SUBDX, pred.test, add=TRUE, col="green")
+
+```
+
+#GBM`
+
+Control.
+
+```{r control_4}
+fitCtrl_1 <- trainControl(method = "repeatedcv",
+                        number = 5,
+                        repeats = 2,
+                        summaryFunction=twoClassSummary,
+                        classProbs = TRUE,
+                        search = "random",
+                        ## Down-sampling
+                        sampling = "smote",
+                        allowParallel = TRUE)
+
+```
+
+Testing grid.
+
+```{r grid_3}
+gbmGrid <-  expand.grid(n.trees = c(1:20)*100,
+                        interaction.depth=c(2,3),
+                        shrinkage = c(0.01, 0.05),
+                        n.minobsinnode=5)
+```
+
+GBM 
+
+
+gbm.res <- train(SUBDX ~ .,
+    
+    data=train,
+    
+    method="gbm",
+    
+    trControl=fitCtrl_1,
+    
+    tuneGrid=gbmGrid,
+    
+    bag.fraction=0.5,
+    
+    metric="ROC",
+    
+    verbose=FALSE)
+
+gbm.res
+
+plot(gbm.res)
+
+
+
+It says I need "DMwR" to run this, but it's not compatible with my version of R (which is completely up to date). From here on out, I'll include the code; but, unfortunately, I can't run it.
+
+Predictions
+
+confusionMatrix(predict(gbm.res, train, type="raw"), train$SUBDX)
+
+confusionMatrix(predict(gbm.res, test, type="raw"), test$SUBDX)
+
+pred.train <- predict(gbm.res, train, type="prob")[,"SU"]
+
+roc(train$SUBDX ~ pred.train)
+
+pred.test <- predict(gbm.res, test, type="prob")[,"SU"]
+
+roc(test$SUBDX ~ pred.test)
+
+plot.roc(train$SUBDX, pred.train)
+
+plot.roc(test$SUBDX, pred.test, add=TRUE, col="green")
+
+
+Variable importance
+
+gbmImp <- varImp(gbm.res)
+
+plot(gbmImp)
+
+
